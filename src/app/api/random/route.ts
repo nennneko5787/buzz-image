@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { MIN_LIKES, REQUIRE_IMAGES } from "@/config/screen-names";
+import { REQUIRE_IMAGES, resolveMinLikes } from "@/config/screen-names";
 import { NoTweetFoundError, getRandomBuzzTweet } from "@/lib/buzz";
 import { MissingAuthTokenError } from "@/lib/emusks-client";
 
@@ -9,14 +9,16 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const exclude =
-    new URL(request.url).searchParams.get("exclude") ?? undefined;
+  const params = new URL(request.url).searchParams;
+  const exclude = params.get("exclude") ?? undefined;
+  // ユーザー指定のしきい値。.env の MIN_LIKES を下回る値は丸められる。
+  const minLikes = resolveMinLikes(params.get("minLikes"));
 
   try {
-    const result = await getRandomBuzzTweet(exclude);
+    const result = await getRandomBuzzTweet(exclude, minLikes);
     return NextResponse.json({
       ...result,
-      criteria: { minLikes: MIN_LIKES, requireImages: REQUIRE_IMAGES },
+      criteria: { minLikes, requireImages: REQUIRE_IMAGES },
     });
   } catch (error) {
     if (error instanceof MissingAuthTokenError) {

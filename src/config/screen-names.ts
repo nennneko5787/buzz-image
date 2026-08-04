@@ -16,8 +16,26 @@ export const DEFAULT_SCREEN_NAMES = [
   "hyoshiok",
 ] as const;
 
-/** いいね数のしきい値（この値「以上」のツイートだけを対象にする） */
+/**
+ * いいね数のしきい値の下限（この値「以上」のツイートだけを収集する）。
+ *
+ * サーバー側の検索クエリ・候補プールはこの値で作られるので、
+ * ユーザーはこれ「以上」の範囲でしか絞り込めない（下限未満は候補が存在しない）。
+ */
 export const MIN_LIKES = Number(process.env.MIN_LIKES ?? 10000);
+
+/**
+ * ユーザーが指定したしきい値を、実際に使える値に正規化する。
+ * 未指定・不正値・下限未満はすべて {@link MIN_LIKES} に丸める。
+ */
+export function resolveMinLikes(
+  raw: string | number | null | undefined,
+): number {
+  if (raw === null || raw === undefined || raw === "") return MIN_LIKES;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return MIN_LIKES;
+  return Math.max(MIN_LIKES, Math.floor(value));
+}
 
 /** 画像が添付されたツイートだけを対象にするか */
 export const REQUIRE_IMAGES =

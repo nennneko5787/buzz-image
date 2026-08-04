@@ -32,6 +32,12 @@ interface PoolEntry {
   retryAfter?: number;
 }
 
+/** 読み込んだプールと、そのうち指定のしきい値を満たすツイート */
+interface LoadedPool {
+  entry: PoolEntry;
+  matched: BuzzTweet[];
+}
+
 /** 列挙が失敗してから再開するまでの待ち時間 */
 const RETRY_DELAY_MS = 60 * 1000;
 
@@ -41,7 +47,12 @@ const globalForPool = globalThis as unknown as {
 
 const pool: Map<string, PoolEntry> = (globalForPool.__buzzPool ??= new Map());
 
-/** 検索クエリを組み立てる */
+/**
+ * 検索クエリを組み立てる。
+ *
+ * ここで使うのは常に下限の {@link MIN_LIKES}。ユーザー指定のしきい値を混ぜると
+ * 値ごとにプールを作り直すことになるので、絞り込みは抽選時に行う。
+ */
 export function buildQuery(screenName: string): string {
   const parts = [
     `from:${screenName}`,
@@ -324,7 +335,7 @@ export interface RandomTweetResult {
   tweet: BuzzTweet;
   /** 抽選に使ったスクリーンネーム */
   screenName: string;
-  /** そのアカウントの候補ツイート数 */
+  /** そのアカウントの候補ツイート数（指定のしきい値を満たすもの） */
   poolSize: number;
   /** そのアカウントの全期間を辿り終えているか（false の間は収集中） */
   poolComplete: boolean;
@@ -348,10 +359,14 @@ function pickWeighted(entries: { screenName: string; size: number }[]) {
  * ただし収集が終わるまでの数リクエストは、まだ集まっている範囲からの抽選になる。
  *
  * @param excludeId 直前に表示したツイート ID（同じものを続けて出さない）
+ * @param minLikes いいね数のしきい値。既定は下限の {@link MIN_LIKES}。
+ *   プールは下限で作られているので、これより低い値を渡しても下限に丸められる。
  */
 export async function getRandomBuzzTweet(
   excludeId?: string,
+  minLikes: number = MIN_LIKES,
 ): Promise<RandomTweetResult> {
+  const threshold = Math.max(MIN_LIKES, minLikes);
   const screenNames = getScreenNames();
   if (screenNames.length === 0) {
     throw new NoTweetFoundError("スクリーンネームが 1 件も設定されていません。");
@@ -361,29 +376,36 @@ export async function getRandomBuzzTweet(
   await getEmusksClient();
 
   const errors = new Set<string>();
-  const pools = new Map<string, PoolEntry>();
+  /** 読み込んだプールと、そのうちしきい値を満たすツイート */
+  const pools = new Map<string, LoadedPool>();
 
-  const loadPool = async (screenName: string): Promise<PoolEntry | null> => {
+  const loadPool = async (screenName: string): Promise<LoadedPool | null> => {
     try {
       const entry = await getPool(screenName);
-      pools.set(screenName, entry);
-      return entry;
+      const loaded: LoadedPool = {
+        entry,
+        matched:
+          threshold <= MIN_LIKES
+            ? entry.tweets
+            : entry.tweets.filter((t) => t.stats.likes >= threshold),
+      };
+      pools.set(screenName, loaded);
+      return loaded;
     } catch (error) {
       errors.add(`@${screenName}: ${(error as Error).message}`);
       return null;
     }
   };
 
-  const draw = (screenName: string, entry: PoolEntry): RandomTweetResult => {
+  const draw = (screenName: string, loaded: LoadedPool): RandomTweetResult => {
+    const { entry, matched } = loaded;
     const candidates =
-      entry.tweets.length > 1
-        ? entry.tweets.filter((t) => t.id !== excludeId)
-        : entry.tweets;
+      matched.length > 1 ? matched.filter((t) => t.id !== excludeId) : matched;
     const tweet = candidates[Math.floor(Math.random() * candidates.length)];
     return {
       tweet,
       screenName,
-      poolSize: entry.tweets.length,
+      poolSize: matched.length,
       poolComplete: entry.complete,
     };
   };
@@ -394,10 +416,10 @@ export async function getRandomBuzzTweet(
     await Promise.all(screenNames.map(loadPool));
 
     const weights = [...pools.entries()]
-      .filter(([, entry]) => entry.tweets.length > 0)
-      .map(([screenName, entry]) => ({
+      .filter(([, { matched }]) => matched.length > 0)
+      .map(([screenName, { matched }]) => ({
         screenName,
-        size: entry.tweets.length,
+        size: matched.length,
       }));
 
     if (weights.length > 0) {
@@ -407,9 +429,9 @@ export async function getRandomBuzzTweet(
   } else {
     // アカウントをシャッフルして、ヒットするまで順に試す（アカウントごとに等確率）
     for (const screenName of shuffle(screenNames)) {
-      const entry = await loadPool(screenName);
-      if (!entry || entry.tweets.length === 0) continue;
-      return draw(screenName, entry);
+      const loaded = await loadPool(screenName);
+      if (!loaded || loaded.matched.length === 0) continue;
+      return draw(screenName, loaded);
     }
   }
 
@@ -418,7 +440,7 @@ export async function getRandomBuzzTweet(
   }
 
   throw new NoTweetFoundError(
-    `条件（いいね ${MIN_LIKES.toLocaleString("ja-JP")} 以上${
+    `条件（いいね ${threshold.toLocaleString("ja-JP")} 以上${
       REQUIRE_IMAGES ? " / 画像付き" : ""
     }）に合うツイートが見つかりませんでした。`,
   );

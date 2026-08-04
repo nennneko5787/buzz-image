@@ -28,7 +28,7 @@ export default async function Home() {
     <main className="flex flex-1 items-start justify-center bg-zinc-50 px-4 py-10 font-sans sm:py-16 dark:bg-black">
       <BuzzViewer
         screenNames={getScreenNames()}
-        minLikes={MIN_LIKES}
+        minLikesFloor={MIN_LIKES}
         untilMonthsAgo={UNTIL_MONTHS_AGO}
         initialData={initialData}
         initialError={initialError}
