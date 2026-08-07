@@ -2,20 +2,16 @@ import "server-only";
 
 import type { EmusksMedia, EmusksTweet } from "emusks";
 
-import {
-  CACHE_TTL_MS,
-  MAX_PAGES,
-  MAX_SYNC_PAGES,
-  MIN_LIKES,
-  PAGE_DELAY_MS,
-  REQUIRE_IMAGES,
-  WEIGHT_BY_POOL_SIZE,
-  formatSearchDate,
-  getScreenNames,
-  getUntilDate,
-} from "@/config/screen-names";
 import { getEmusksClient } from "@/lib/emusks-client";
+import { EnumerationGate, mapWithConcurrency } from "@/lib/enumeration-gate";
 import { readStoredPool, writeStoredPool } from "@/lib/pool-cache";
+import { getSettings, resolveScreenNames } from "@/lib/settings";
+import {
+  type AppSettings,
+  formatSearchDate,
+  getUntilDate,
+  resolveMinLikes,
+} from "@/lib/settings-schema";
 import type { BuzzMedia, BuzzMediaKind, BuzzTweet } from "@/lib/types";
 
 interface PoolEntry {
@@ -43,26 +39,34 @@ const RETRY_DELAY_MS = 60 * 1000;
 
 const globalForPool = globalThis as unknown as {
   __buzzPool?: Map<string, PoolEntry>;
+  __buzzGate?: EnumerationGate;
 };
 
 const pool: Map<string, PoolEntry> = (globalForPool.__buzzPool ??= new Map());
 
+/** バックグラウンドで走る列挙の同時実行数を抑えるゲート */
+const gate: EnumerationGate = (globalForPool.__buzzGate ??=
+  new EnumerationGate());
+
 /**
  * 検索クエリを組み立てる。
  *
- * ここで使うのは常に下限の {@link MIN_LIKES}。ユーザー指定のしきい値を混ぜると
+ * ここで使うのは常に下限の `minLikes`。ユーザー指定のしきい値を混ぜると
  * 値ごとにプールを作り直すことになるので、絞り込みは抽選時に行う。
  */
-export function buildQuery(screenName: string): string {
+export function buildQuery(
+  screenName: string,
+  settings: AppSettings,
+): string {
   const parts = [
     `from:${screenName}`,
-    `min_faves:${MIN_LIKES}`,
+    `min_faves:${settings.minLikes}`,
     "-filter:replies",
     "-filter:nativeretweets",
   ];
-  if (REQUIRE_IMAGES) parts.push("filter:images");
+  if (settings.requireImages) parts.push("filter:images");
 
-  const until = getUntilDate();
+  const until = getUntilDate(settings.untilMonthsAgo);
   if (until) parts.push(`until:${formatSearchDate(until)}`);
 
   return parts.join(" ");
@@ -169,17 +173,18 @@ function mergePage(
   entry: PoolEntry,
   screenName: string,
   rawTweets: EmusksTweet[],
+  settings: AppSettings,
 ): number {
   const seen = new Set(entry.tweets.map((t) => t.id));
-  const until = getUntilDate()?.getTime();
+  const until = getUntilDate(settings.untilMonthsAgo)?.getTime();
   let added = 0;
 
   for (const raw of rawTweets) {
     const tweet = toBuzzTweet(raw);
     if (!tweet) continue;
     if (seen.has(tweet.id)) continue;
-    if (tweet.stats.likes < MIN_LIKES) continue;
-    if (REQUIRE_IMAGES && tweet.media.length === 0) continue;
+    if (tweet.stats.likes < settings.minLikes) continue;
+    if (settings.requireImages && tweet.media.length === 0) continue;
     // until: が効かなかった場合の保険。指定日より新しい投稿は除外する。
     if (until !== undefined && new Date(tweet.createdAt).getTime() >= until) {
       continue;
@@ -200,6 +205,7 @@ function mergePage(
 async function fetchNextPage(
   entry: PoolEntry,
   screenName: string,
+  settings: AppSettings,
 ): Promise<void> {
   const client = await getEmusksClient();
   const result = await client.search.latest(entry.query, {
@@ -208,7 +214,7 @@ async function fetchNextPage(
     cursor: entry.cursor ?? undefined,
   });
 
-  mergePage(entry, screenName, result.tweets);
+  mergePage(entry, screenName, result.tweets, settings);
   entry.cursor = result.nextCursor;
 
   // カーソルが尽きた or 空ページに当たったら辿り終えたとみなす
@@ -220,25 +226,44 @@ async function fetchNextPage(
 /**
  * 残りのページを最後まで辿る（＝全期間ぶんを列挙する）。
  * 初回表示を待たせないため、バックグラウンドで走らせる想定。
+ *
+ * 同時に走る本数は {@link gate} が制限する。上限に達しているあいだは
+ * ここで順番待ちになる。
  */
 async function enumerateRest(
   entry: PoolEntry,
   screenName: string,
+  settings: AppSettings,
 ): Promise<void> {
-  for (let page = 0; page < MAX_PAGES && !entry.complete; page += 1) {
-    if (PAGE_DELAY_MS > 0) await sleep(PAGE_DELAY_MS);
-    try {
-      await fetchNextPage(entry, screenName);
-    } catch (error) {
-      // レート制限などで失敗したら、集まったぶんとカーソルは残して打ち切る。
-      // しばらく間を空けてから、次のリクエストで続きから再開する。
-      console.warn(`[buzz] @${screenName} の列挙を中断:`, error);
-      entry.retryAfter = Date.now() + RETRY_DELAY_MS;
-      break;
+  gate.setLimit(settings.maxConcurrentEnumerations);
+  await gate.acquire();
+
+  try {
+    // 順番待ちのあいだに設定が変わってプールが作り直されていたら、
+    // 古いほうを辿り続けても意味がないのでやめる
+    if (pool.get(screenName.toLowerCase()) !== entry) return;
+
+    for (
+      let page = 0;
+      page < settings.maxPages && !entry.complete;
+      page += 1
+    ) {
+      if (settings.pageDelayMs > 0) await sleep(settings.pageDelayMs);
+      try {
+        await fetchNextPage(entry, screenName, settings);
+      } catch (error) {
+        // レート制限などで失敗したら、集まったぶんとカーソルは残して打ち切る。
+        // しばらく間を空けてから、次のリクエストで続きから再開する。
+        console.warn(`[buzz] @${screenName} の列挙を中断:`, error);
+        entry.retryAfter = Date.now() + RETRY_DELAY_MS;
+        break;
+      }
     }
+  } finally {
+    gate.release();
   }
 
-  await writeStoredPool(screenName, {
+  await writeStoredPool(screenName, settings.cacheDir, {
     query: entry.query,
     tweets: entry.tweets,
     complete: entry.complete,
@@ -251,11 +276,12 @@ async function enumerateRest(
 function continueEnumerationInBackground(
   entry: PoolEntry,
   screenName: string,
+  settings: AppSettings,
 ): void {
   if (entry.complete || entry.enumerating) return;
   if (entry.retryAfter && Date.now() < entry.retryAfter) return;
   entry.retryAfter = undefined;
-  entry.enumerating = enumerateRest(entry, screenName).finally(() => {
+  entry.enumerating = enumerateRest(entry, screenName, settings).finally(() => {
     entry.enumerating = undefined;
   });
 }
@@ -267,22 +293,27 @@ function continueEnumerationInBackground(
  * - 何もなければ 1 ページだけ同期で取得して即座に返す（初回表示を待たせない）
  * - 残りのページはバックグラウンドで最後まで辿る
  */
-async function getPool(screenName: string): Promise<PoolEntry> {
+async function getPool(
+  screenName: string,
+  settings: AppSettings,
+): Promise<PoolEntry> {
   const key = screenName.toLowerCase();
-  const query = buildQuery(screenName);
+  const query = buildQuery(screenName, settings);
 
   let entry = pool.get(key);
 
   // 検索条件が変わっていたらキャッシュを捨てる
   if (entry && entry.query !== query) entry = undefined;
-  if (entry && Date.now() - entry.fetchedAt >= CACHE_TTL_MS) entry = undefined;
+  if (entry && Date.now() - entry.fetchedAt >= settings.cacheTtlMs) {
+    entry = undefined;
+  }
 
   if (!entry) {
-    const stored = await readStoredPool(screenName);
+    const stored = await readStoredPool(screenName, settings.cacheDir);
     if (
       stored &&
       stored.query === query &&
-      Date.now() - stored.fetchedAt < CACHE_TTL_MS
+      Date.now() - stored.fetchedAt < settings.cacheTtlMs
     ) {
       entry = {
         query,
@@ -304,14 +335,14 @@ async function getPool(screenName: string): Promise<PoolEntry> {
     };
     // すぐ表示できるよう、最低 1 件見つかるまで同期で辿る。
     // 期間指定などで先頭ページに該当が 0 件のことがあるため 1 ページで打ち切らない。
-    for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
-      await fetchNextPage(entry, screenName);
+    for (let page = 0; page < settings.maxSyncPages; page += 1) {
+      await fetchNextPage(entry, screenName, settings);
       if (entry.tweets.length > 0 || entry.complete) break;
     }
   }
 
   pool.set(key, entry);
-  continueEnumerationInBackground(entry, screenName);
+  continueEnumerationInBackground(entry, screenName, settings);
   return entry;
 }
 
@@ -339,6 +370,8 @@ export interface RandomTweetResult {
   poolSize: number;
   /** そのアカウントの全期間を辿り終えているか（false の間は収集中） */
   poolComplete: boolean;
+  /** 実際に使った抽選条件 */
+  criteria: { minLikes: number; requireImages: boolean };
 }
 
 /** 候補数で重み付けして 1 アカウント選ぶ */
@@ -359,15 +392,21 @@ function pickWeighted(entries: { screenName: string; size: number }[]) {
  * ただし収集が終わるまでの数リクエストは、まだ集まっている範囲からの抽選になる。
  *
  * @param excludeId 直前に表示したツイート ID（同じものを続けて出さない）
- * @param minLikes いいね数のしきい値。既定は下限の {@link MIN_LIKES}。
- *   プールは下限で作られているので、これより低い値を渡しても下限に丸められる。
+ * @param minLikes いいね数のしきい値。プールは設定の下限で作られているので、
+ *   それより低い値を渡しても下限に丸められる。
  */
 export async function getRandomBuzzTweet(
   excludeId?: string,
-  minLikes: number = MIN_LIKES,
+  minLikes?: string | number | null,
 ): Promise<RandomTweetResult> {
-  const threshold = Math.max(MIN_LIKES, minLikes);
-  const screenNames = getScreenNames();
+  const settings = await getSettings();
+  const threshold = resolveMinLikes(minLikes, settings.minLikes);
+  const criteria = {
+    minLikes: threshold,
+    requireImages: settings.requireImages,
+  };
+
+  const screenNames = resolveScreenNames(settings);
   if (screenNames.length === 0) {
     throw new NoTweetFoundError("スクリーンネームが 1 件も設定されていません。");
   }
@@ -381,11 +420,11 @@ export async function getRandomBuzzTweet(
 
   const loadPool = async (screenName: string): Promise<LoadedPool | null> => {
     try {
-      const entry = await getPool(screenName);
+      const entry = await getPool(screenName, settings);
       const loaded: LoadedPool = {
         entry,
         matched:
-          threshold <= MIN_LIKES
+          threshold <= settings.minLikes
             ? entry.tweets
             : entry.tweets.filter((t) => t.stats.likes >= threshold),
       };
@@ -407,13 +446,19 @@ export async function getRandomBuzzTweet(
       screenName,
       poolSize: matched.length,
       poolComplete: entry.complete,
+      criteria,
     };
   };
 
-  if (WEIGHT_BY_POOL_SIZE) {
+  if (settings.weightByPoolSize) {
     // 全アカウントのプールを用意し、候補数で重み付けして選ぶ
-    // （＝全アカウントの全ツイートの中で一様）
-    await Promise.all(screenNames.map(loadPool));
+    // （＝全アカウントの全ツイートの中で一様）。
+    // ここも同時に走る数は列挙の上限に合わせて絞る。
+    await mapWithConcurrency(
+      screenNames,
+      settings.maxConcurrentEnumerations,
+      loadPool,
+    );
 
     const weights = [...pools.entries()]
       .filter(([, { matched }]) => matched.length > 0)
@@ -441,7 +486,7 @@ export async function getRandomBuzzTweet(
 
   throw new NoTweetFoundError(
     `条件（いいね ${threshold.toLocaleString("ja-JP")} 以上${
-      REQUIRE_IMAGES ? " / 画像付き" : ""
+      settings.requireImages ? " / 画像付き" : ""
     }）に合うツイートが見つかりませんでした。`,
   );
 }

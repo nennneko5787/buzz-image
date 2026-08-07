@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 
-import { REQUIRE_IMAGES, resolveMinLikes } from "@/config/screen-names";
 import { NoTweetFoundError, getRandomBuzzTweet } from "@/lib/buzz";
 import { MissingAuthTokenError } from "@/lib/emusks-client";
 
@@ -11,15 +10,11 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const params = new URL(request.url).searchParams;
   const exclude = params.get("exclude") ?? undefined;
-  // ユーザー指定のしきい値。.env の MIN_LIKES を下回る値は丸められる。
-  const minLikes = resolveMinLikes(params.get("minLikes"));
+  // ユーザー指定のしきい値。設定の下限を下回る値は丸められる。
+  const minLikes = params.get("minLikes");
 
   try {
-    const result = await getRandomBuzzTweet(exclude, minLikes);
-    return NextResponse.json({
-      ...result,
-      criteria: { minLikes, requireImages: REQUIRE_IMAGES },
-    });
+    return NextResponse.json(await getRandomBuzzTweet(exclude, minLikes));
   } catch (error) {
     if (error instanceof MissingAuthTokenError) {
       return NextResponse.json({ error: error.message }, { status: 503 });

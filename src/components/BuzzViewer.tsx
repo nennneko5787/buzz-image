@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { TweetCard } from "@/components/TweetCard";
@@ -175,6 +176,13 @@ export function BuzzViewer({
           ))}
         </ul>
       </details>
+
+      <Link
+        href="/settings"
+        className="text-xs text-black/45 underline-offset-4 hover:underline dark:text-white/45"
+      >
+        設定パネル
+      </Link>
     </div>
   );
 }

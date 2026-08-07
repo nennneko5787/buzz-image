@@ -1,25 +1,18 @@
 import { BuzzViewer } from "@/components/BuzzViewer";
-import {
-  MIN_LIKES,
-  REQUIRE_IMAGES,
-  UNTIL_MONTHS_AGO,
-  getScreenNames,
-} from "@/config/screen-names";
 import { getRandomBuzzTweet } from "@/lib/buzz";
+import { getSettings, resolveScreenNames } from "@/lib/settings";
 import type { RandomTweetResponse } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
+  const settings = await getSettings();
+
   let initialData: RandomTweetResponse | null = null;
   let initialError: string | null = null;
 
   try {
-    const result = await getRandomBuzzTweet();
-    initialData = {
-      ...result,
-      criteria: { minLikes: MIN_LIKES, requireImages: REQUIRE_IMAGES },
-    };
+    initialData = await getRandomBuzzTweet();
   } catch (error) {
     initialError = (error as Error).message;
   }
@@ -27,9 +20,9 @@ export default async function Home() {
   return (
     <main className="flex flex-1 items-start justify-center bg-zinc-50 px-4 py-10 font-sans sm:py-16 dark:bg-black">
       <BuzzViewer
-        screenNames={getScreenNames()}
-        minLikesFloor={MIN_LIKES}
-        untilMonthsAgo={UNTIL_MONTHS_AGO}
+        screenNames={resolveScreenNames(settings)}
+        minLikesFloor={settings.minLikes}
+        untilMonthsAgo={settings.untilMonthsAgo}
         initialData={initialData}
         initialError={initialError}
       />
