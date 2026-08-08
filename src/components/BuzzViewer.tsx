@@ -3,17 +3,19 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { AccountFilter, useAccountSelection } from "@/components/AccountFilter";
 import { TweetCard } from "@/components/TweetCard";
-import type { RandomTweetResponse } from "@/lib/types";
+import type { BuzzAccount, RandomTweetResponse } from "@/lib/types";
 
 export function BuzzViewer({
-  screenNames,
+  accounts,
   minLikesFloor,
   untilMonthsAgo,
   initialData,
   initialError,
 }: {
-  screenNames: string[];
+  /** 設定済みのアカウント（絞り込みのプルダウンに出す） */
+  accounts: BuzzAccount[];
   /**
    * サーバー側（.env の MIN_LIKES）で収集しているいいね数の下限。
    * 候補プール自体がこの値で作られているので、これより低くは絞り込めない。
@@ -37,13 +39,20 @@ export function BuzzViewer({
   const periodLabel =
     untilMonthsAgo === null ? "全期間" : `${untilMonthsAgo} ヶ月前より古い投稿`;
 
-  const load = useCallback(async (threshold: number) => {
+  const load = useCallback(async (threshold: number, names: string[]) => {
+    if (names.length === 0) {
+      setData(null);
+      setError("対象のアカウントが 1 件も選ばれていません。");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
       if (currentId.current) params.set("exclude", currentId.current);
       params.set("minLikes", String(threshold));
+      params.set("users", names.join(","));
       const res = await fetch(`/api/random?${params}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
@@ -56,6 +65,22 @@ export function BuzzViewer({
     }
   }, []);
 
+  // 初回のツイートは全アカウントから引いてあるので、
+  // 前回の絞り込みが復元されて対象外になっていたら引き直す
+  const { selected, setSelected } = useAccountSelection(accounts, (names) => {
+    const current = data?.screenName?.toLowerCase();
+    if (current && names.some((name) => name.toLowerCase() === current)) return;
+    void load(minLikes, names);
+  });
+
+  const changeAccounts = useCallback(
+    (names: string[]) => {
+      setSelected(names);
+      void load(minLikes, names);
+    },
+    [load, minLikes, setSelected],
+  );
+
   /** 入力欄の値を確定し、変わっていれば新しい条件で引き直す */
   const commitMinLikes = useCallback(() => {
     const parsed = Number(minLikesInput);
@@ -66,59 +91,85 @@ export function BuzzViewer({
     setMinLikesInput(String(next));
     if (next === minLikes) return;
     setMinLikes(next);
-    void load(next);
-  }, [load, minLikes, minLikesFloor, minLikesInput]);
+    void load(next, selected);
+  }, [load, minLikes, minLikesFloor, minLikesInput, selected]);
 
   // スペースキーでも次のツイートを引ける
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA"].includes(target.tagName)) return;
+      // 入力欄やボタンの上では、そのコントロール本来の動きを邪魔しない
+      if (
+        target &&
+        ["INPUT", "TEXTAREA", "BUTTON", "SELECT", "SUMMARY", "A"].includes(
+          target.tagName,
+        )
+      ) {
+        return;
+      }
       if (event.code !== "Space") return;
       event.preventDefault();
-      if (!loading) void load(minLikes);
+      if (!loading) void load(minLikes, selected);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [load, loading, minLikes]);
+  }, [load, loading, minLikes, selected]);
 
   return (
     <div className="flex w-full max-w-2xl flex-col items-center gap-6">
       <header className="w-full text-center">
         <h1 className="text-2xl font-bold sm:text-3xl">バズツイートガチャ</h1>
         <p className="mt-2 text-sm text-black/60 dark:text-white/60">
-          登録済みの {screenNames.length} アカウントの{periodLabel}から、いいね{" "}
+          選択中の {selected.length} アカウントの{periodLabel}から、いいね{" "}
           {minLikes.toLocaleString("ja-JP")} 以上のツイートをランダム表示します。
         </p>
       </header>
 
-      <div className="flex w-full flex-col items-center gap-1">
-        <label className="flex flex-wrap items-center justify-center gap-2 text-sm">
-          <span className="font-medium">いいね数のしきい値</span>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={minLikesFloor}
-            step={1000}
-            value={minLikesInput}
+      <div className="grid w-full gap-3 sm:grid-cols-2">
+        <div className="flex flex-col gap-1">
+          <span className="text-sm font-medium">対象アカウント</span>
+          <AccountFilter
+            accounts={accounts}
+            selected={selected}
+            onChange={changeAccounts}
             disabled={loading}
-            onChange={(event) => setMinLikesInput(event.target.value)}
-            onBlur={commitMinLikes}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                commitMinLikes();
-              }
-            }}
-            className="w-32 rounded-lg border border-black/15 bg-transparent px-3 py-1.5 text-right tabular-nums disabled:opacity-50 dark:border-white/20"
           />
-          <span className="text-black/60 dark:text-white/60">以上</span>
-        </label>
-        <p className="text-xs text-black/45 dark:text-white/45">
-          サーバー側で集めている下限は {minLikesFloor.toLocaleString("ja-JP")}{" "}
-          です。これより低い値は下限に丸められます。
-        </p>
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <label htmlFor="min-likes" className="text-sm font-medium">
+            いいね数のしきい値
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              id="min-likes"
+              type="number"
+              inputMode="numeric"
+              min={minLikesFloor}
+              step={1000}
+              value={minLikesInput}
+              disabled={loading}
+              onChange={(event) => setMinLikesInput(event.target.value)}
+              onBlur={commitMinLikes}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitMinLikes();
+                }
+              }}
+              className="w-full rounded-lg border border-black/15 bg-transparent px-3 py-1.5 text-right tabular-nums disabled:opacity-50 dark:border-white/20"
+            />
+            <span className="shrink-0 text-sm text-black/60 dark:text-white/60">
+              以上
+            </span>
+          </div>
+        </div>
       </div>
+
+      <p className="-mt-4 w-full text-xs text-black/45 dark:text-white/45">
+        サーバー側で集めている下限は {minLikesFloor.toLocaleString("ja-JP")}{" "}
+        です。これより低い値は下限に丸められます。
+      </p>
 
       <div className="flex w-full min-h-[420px] flex-col items-center justify-center gap-4">
         {error && (
@@ -150,39 +201,27 @@ export function BuzzViewer({
 
       <button
         type="button"
-        onClick={() => void load(minLikes)}
-        disabled={loading}
+        onClick={() => void load(minLikes, selected)}
+        disabled={loading || selected.length === 0}
         className="rounded-full bg-black px-8 py-3 font-bold text-white transition hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white dark:text-black"
       >
         {loading ? "抽選中…" : "次のツイート（Space）"}
       </button>
 
-      <details className="w-full rounded-2xl border border-black/10 p-4 text-sm dark:border-white/15">
-        <summary className="cursor-pointer font-medium">
-          登録アカウント一覧（{screenNames.length}）
-        </summary>
-        <ul className="mt-3 flex flex-wrap gap-2">
-          {screenNames.map((name) => (
-            <li key={name}>
-              <a
-                href={`https://x.com/${name}`}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="rounded-full bg-black/[0.05] px-3 py-1 text-xs hover:underline dark:bg-white/[0.08]"
-              >
-                @{name}
-              </a>
-            </li>
-          ))}
-        </ul>
-      </details>
-
-      <Link
-        href="/settings"
-        className="text-xs text-black/45 underline-offset-4 hover:underline dark:text-white/45"
-      >
-        設定パネル
-      </Link>
+      <div className="flex items-center gap-4 text-xs">
+        <Link
+          href="/stored"
+          className="text-black/60 underline-offset-4 hover:underline dark:text-white/60"
+        >
+          ストア済みツイート一覧
+        </Link>
+        <Link
+          href="/settings"
+          className="text-black/45 underline-offset-4 hover:underline dark:text-white/45"
+        >
+          設定パネル
+        </Link>
+      </div>
     </div>
   );
 }

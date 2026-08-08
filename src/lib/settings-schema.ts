@@ -209,9 +209,9 @@ export const SETTING_FIELDS: readonly SettingField[] = [
   {
     key: "cacheDir",
     env: "CACHE_DIR",
-    label: "ディスクキャッシュ先",
+    label: "保存先ディレクトリ",
     description:
-      "候補プールを保存するディレクトリ。相対パスはプロジェクトルート基準です。",
+      "集めたツイートを入れる buzz.db を置くディレクトリ。相対パスはプロジェクトルート基準です。",
     kind: "text",
     group: "キャッシュ",
     placeholder: ".cache/buzz-pools",
